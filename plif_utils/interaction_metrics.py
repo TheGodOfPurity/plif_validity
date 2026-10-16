@@ -8,20 +8,16 @@ This module is designed for the common workflow:
 
 Two backends are provided:
 - ProLIF: uses the same preparation logic as the rest of this repository.
-- PLIP: optional backend that shells out to ``plipcmd`` and parses the XML report.
+- PLIP: optional backend that uses the installed ``plip`` Python package directly.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
-import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Iterator, Literal, Sequence
-import shutil
-import subprocess
-import sys
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -557,94 +553,126 @@ def _find_plip_xml(output_dir: str | Path) -> Path:
     return xml_files[0]
 
 
-def _resolve_plip_command(plip_command: str | Sequence[str]) -> list[str]:
-    """Resolve a usable PLIP command prefix.
+def _safe_getattr(obj: object, *names: str) -> str:
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            if value is not None:
+                return str(value)
+    return ""
 
-    Resolution order:
-    1. explicit executable on PATH,
-    2. common CLI names: ``plipcmd`` then ``plip``,
-    3. ``python -m plip.plipcmd``,
-    4. ``python path/to/plipcmd.py`` inside the installed package.
-    """
 
-    if isinstance(plip_command, Sequence) and not isinstance(plip_command, str):
-        command = [str(part) for part in plip_command]
-        if command:
-            executable = shutil.which(command[0])
-            if executable is not None:
-                command[0] = executable
-                return command
-        raise FileNotFoundError(
-            f"Cannot find PLIP executable from sequence: {plip_command}"
+def _iter_plip_interaction_objects(interaction_set: object) -> Iterator[tuple[str, object]]:
+    attr_to_type = (
+        ("hydrophobic_contacts", "Hydrophobic"),
+        ("hbonds_ldon", "Hbond"),
+        ("hbonds_pdon", "Hbond"),
+        ("water_bridges", "WaterBridge"),
+        ("saltbridge_lneg", "SaltBridge"),
+        ("saltbridge_pneg", "SaltBridge"),
+        ("pistacking", "PiStacking"),
+        ("pication_laro", "PiCation"),
+        ("pication_paro", "PiCation"),
+        ("halogen_bonds", "HalogenBond"),
+        ("metal_complexes", "MetalComplex"),
+    )
+
+    seen_ids: set[int] = set()
+    for attr_name, interaction_type in attr_to_type:
+        interactions = getattr(interaction_set, attr_name, None)
+        if not interactions:
+            continue
+        for interaction in interactions:
+            seen_ids.add(id(interaction))
+            yield interaction_type, interaction
+
+    for interaction in getattr(interaction_set, "all_itypes", []) or []:
+        if id(interaction) in seen_ids:
+            continue
+        interaction_type = _safe_getattr(
+            interaction,
+            "itype",
+            "type",
+            "__class__",
         )
-
-    explicit = str(plip_command)
-    if explicit and shutil.which(explicit) is not None:
-        return [shutil.which(explicit) or explicit]
-
-    for candidate in ("plipcmd", "plip"):
-        resolved = shutil.which(candidate)
-        if resolved is not None:
-            return [resolved]
-
-    if importlib.util.find_spec("plip.plipcmd") is not None:
-        return [sys.executable, "-m", "plip.plipcmd"]
-
-    plip_spec = importlib.util.find_spec("plip")
-    if plip_spec is not None and plip_spec.origin:
-        package_dir = Path(plip_spec.origin).resolve().parent
-        script_path = package_dir / "plipcmd.py"
-        if script_path.exists():
-            return [sys.executable, str(script_path)]
-
-    raise FileNotFoundError(
-        "Cannot find a usable PLIP entrypoint. Tried explicit command, `plipcmd`, "
-        "`plip`, `python -m plip.plipcmd`, and the installed package script path."
-    )
+        if interaction_type.startswith("<class"):
+            interaction_type = interaction.__class__.__name__
+        yield interaction_type, interaction
 
 
-def run_plip_for_complex(
+def _plip_interaction_to_feature(interaction_type: str, interaction: object) -> str:
+    residue_name = _safe_getattr(interaction, "restype", "resname")
+    residue_number = _safe_getattr(interaction, "resnr", "resnum")
+    chain_id = _safe_getattr(interaction, "reschain", "chain")
+    sidechain = _safe_getattr(interaction, "sidechain")
+
+    residue_token = f"{residue_name}{residue_number}"
+    if chain_id:
+        residue_token = f"{chain_id}:{residue_token}"
+    if not residue_token.strip(":"):
+        residue_token = "UNK"
+
+    feature = f"{residue_token}|{interaction_type}"
+    if sidechain:
+        feature = f"{feature}|{sidechain}"
+    return feature
+
+
+def _select_plip_interaction_set(analyzer: object, residue_name: str = "LIG") -> object:
+    interaction_sets = getattr(analyzer, "interaction_sets", None)
+    if not interaction_sets:
+        raise ValueError("PLIP did not produce any interaction set")
+
+    for ligand in getattr(analyzer, "ligands", []) or []:
+        hetid = _safe_getattr(ligand, "hetid")
+        chain = _safe_getattr(ligand, "chain")
+        position = _safe_getattr(ligand, "position")
+        bsid = ":".join(filter(None, [hetid, chain, position]))
+        if hetid == residue_name and bsid in interaction_sets:
+            return interaction_sets[bsid]
+
+    for bsid, interaction_set in interaction_sets.items():
+        if residue_name in str(bsid):
+            return interaction_set
+
+    return next(iter(interaction_sets.values()))
+
+
+def compute_plip_feature_counts_from_complex(
     complex_pdb: str | Path,
-    output_dir: str | Path,
     *,
-    plip_command: str | Sequence[str] = "plipcmd",
-    extra_args: Iterable[str] | None = None,
-) -> Path:
-    """Run PLIP and return the generated XML report path.
+    ligand_residue_name: str = "LIG",
+) -> dict[str, int]:
+    """Use the installed PLIP Python package to extract interaction feature counts."""
 
-    Notes:
-        This function expects a working CLI installation such as ``plipcmd``.
-        The command line is based on the documented ``-f``, ``-o`` and ``-x`` flags.
-    """
+    try:
+        from plip.structure.preparation import PDBComplex
+    except ImportError as exc:
+        raise ImportError(
+            "The PLIP Python package is required for the PLIP backend."
+        ) from exc
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    command = _resolve_plip_command(plip_command) + [
-        "-f",
-        str(complex_pdb),
-        "-o",
-        str(output_path),
-        "-x",
-    ]
-    if extra_args:
-        command.extend(extra_args)
+    analyzer = PDBComplex()
+    analyzer.output_path = str(Path(complex_pdb).parent)
+    analyzer.load_pdb(str(complex_pdb))
+    analyzer.analyze()
 
-    subprocess.run(
-        command,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    interaction_set = _select_plip_interaction_set(
+        analyzer,
+        residue_name=ligand_residue_name,
     )
-    return _find_plip_xml(output_path)
+    counts: Counter[str] = Counter()
+    for interaction_type, interaction in _iter_plip_interaction_objects(interaction_set):
+        feature = _plip_interaction_to_feature(interaction_type, interaction)
+        counts[feature] += 1
+    return dict(counts)
 
 
 def compute_plip_feature_counts(
     protein_pdb: str | Path,
     ligand_mol: Chem.Mol,
     *,
-    plip_command: str | Sequence[str] = "plipcmd",
-    extra_args: Iterable[str] | None = None,
+    ligand_residue_name: str = "LIG",
 ) -> dict[str, int]:
     """Run PLIP on one protein-ligand pair and return flat interaction feature counts."""
 
@@ -654,14 +682,12 @@ def compute_plip_feature_counts(
             protein_pdb=protein_pdb,
             ligand_mol=ligand_mol,
             output_pdb=tmpdir_path / "complex.pdb",
+            residue_name=ligand_residue_name,
         )
-        xml_report = run_plip_for_complex(
+        return compute_plip_feature_counts_from_complex(
             complex_pdb=complex_pdb,
-            output_dir=tmpdir_path / "plip_output",
-            plip_command=plip_command,
-            extra_args=extra_args,
+            ligand_residue_name=ligand_residue_name,
         )
-        return parse_plip_xml_report(xml_report)
 
 
 def load_first_molecule_from_sdf(sdf_file: str | Path) -> Chem.Mol:
@@ -677,8 +703,7 @@ def evaluate_generated_molecules_plip(
     reference_sdf: str | Path,
     generated_sdf_path: str | Path,
     *,
-    plip_command: str | Sequence[str] = "plipcmd",
-    extra_args: Iterable[str] | None = None,
+    ligand_residue_name: str = "LIG",
     raise_on_error: bool = False,
 ) -> pd.DataFrame:
     """Score a directory of generated ligands with the PLIP backend."""
@@ -687,8 +712,7 @@ def evaluate_generated_molecules_plip(
     reference_counts = compute_plip_feature_counts(
         protein_pdb=protein_pdb,
         ligand_mol=reference_mol,
-        plip_command=plip_command,
-        extra_args=extra_args,
+        ligand_residue_name=ligand_residue_name,
     )
 
     results: list[InteractionScores] = []
@@ -697,8 +721,7 @@ def evaluate_generated_molecules_plip(
             query_counts = compute_plip_feature_counts(
                 protein_pdb=protein_pdb,
                 ligand_mol=record.mol,
-                plip_command=plip_command,
-                extra_args=extra_args,
+                ligand_residue_name=ligand_residue_name,
             )
             results.append(
                 score_feature_counts(
