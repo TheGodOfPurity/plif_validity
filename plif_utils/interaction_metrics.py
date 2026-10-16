@@ -132,16 +132,49 @@ def rdkit_to_prolif_ligand(
 
 
 def iter_sdf_molecules(sdf_file: str | Path) -> Iterator[LigandRecord]:
-    """Yield all valid molecules from an SDF file."""
+    """Yield all valid molecules from an SDF file.
+
+    Invalid records are skipped so that one broken generated molecule does not stop
+    the whole batch.
+    """
 
     sdf_path = Path(sdf_file)
-    supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
-    for idx, mol in enumerate(supplier):
+    try:
+        content = sdf_path.read_text(errors="ignore")
+    except OSError:
+        return
+
+    for idx, block in enumerate(content.split("$$$$")):
+        block = block.strip()
+        if not block:
+            continue
+        if not block.endswith("M  END"):
+            block = f"{block}\n"
+
+        mol = None
+        for sanitize in (True, False):
+            try:
+                mol = Chem.MolFromMolBlock(
+                    f"{block}\n$$$$\n",
+                    sanitize=sanitize,
+                    removeHs=False,
+                    strictParsing=False,
+                )
+            except Exception:
+                mol = None
+            if mol is not None:
+                break
+
         if mol is None:
             continue
-        name = mol.GetProp("_Name").strip() if mol.HasProp("_Name") else ""
+
+        try:
+            name = mol.GetProp("_Name").strip() if mol.HasProp("_Name") else ""
+        except Exception:
+            name = ""
         if not name:
             name = f"{sdf_path.stem}_{idx}"
+
         yield LigandRecord(
             source_file=str(sdf_path),
             molecule_index=idx,
