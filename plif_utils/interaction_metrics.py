@@ -15,11 +15,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
+import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Iterator, Literal, Sequence
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -555,11 +557,57 @@ def _find_plip_xml(output_dir: str | Path) -> Path:
     return xml_files[0]
 
 
+def _resolve_plip_command(plip_command: str | Sequence[str]) -> list[str]:
+    """Resolve a usable PLIP command prefix.
+
+    Resolution order:
+    1. explicit executable on PATH,
+    2. common CLI names: ``plipcmd`` then ``plip``,
+    3. ``python -m plip.plipcmd``,
+    4. ``python path/to/plipcmd.py`` inside the installed package.
+    """
+
+    if isinstance(plip_command, Sequence) and not isinstance(plip_command, str):
+        command = [str(part) for part in plip_command]
+        if command:
+            executable = shutil.which(command[0])
+            if executable is not None:
+                command[0] = executable
+                return command
+        raise FileNotFoundError(
+            f"Cannot find PLIP executable from sequence: {plip_command}"
+        )
+
+    explicit = str(plip_command)
+    if explicit and shutil.which(explicit) is not None:
+        return [shutil.which(explicit) or explicit]
+
+    for candidate in ("plipcmd", "plip"):
+        resolved = shutil.which(candidate)
+        if resolved is not None:
+            return [resolved]
+
+    if importlib.util.find_spec("plip.plipcmd") is not None:
+        return [sys.executable, "-m", "plip.plipcmd"]
+
+    plip_spec = importlib.util.find_spec("plip")
+    if plip_spec is not None and plip_spec.origin:
+        package_dir = Path(plip_spec.origin).resolve().parent
+        script_path = package_dir / "plipcmd.py"
+        if script_path.exists():
+            return [sys.executable, str(script_path)]
+
+    raise FileNotFoundError(
+        "Cannot find a usable PLIP entrypoint. Tried explicit command, `plipcmd`, "
+        "`plip`, `python -m plip.plipcmd`, and the installed package script path."
+    )
+
+
 def run_plip_for_complex(
     complex_pdb: str | Path,
     output_dir: str | Path,
     *,
-    plip_command: str = "plipcmd",
+    plip_command: str | Sequence[str] = "plipcmd",
     extra_args: Iterable[str] | None = None,
 ) -> Path:
     """Run PLIP and return the generated XML report path.
@@ -569,15 +617,9 @@ def run_plip_for_complex(
         The command line is based on the documented ``-f``, ``-o`` and ``-x`` flags.
     """
 
-    if shutil.which(plip_command) is None:
-        raise FileNotFoundError(
-            f"Cannot find PLIP executable: {plip_command}. Install PLIP or pass a valid command."
-        )
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    command = [
-        plip_command,
+    command = _resolve_plip_command(plip_command) + [
         "-f",
         str(complex_pdb),
         "-o",
@@ -601,7 +643,7 @@ def compute_plip_feature_counts(
     protein_pdb: str | Path,
     ligand_mol: Chem.Mol,
     *,
-    plip_command: str = "plipcmd",
+    plip_command: str | Sequence[str] = "plipcmd",
     extra_args: Iterable[str] | None = None,
 ) -> dict[str, int]:
     """Run PLIP on one protein-ligand pair and return flat interaction feature counts."""
@@ -635,7 +677,7 @@ def evaluate_generated_molecules_plip(
     reference_sdf: str | Path,
     generated_sdf_path: str | Path,
     *,
-    plip_command: str = "plipcmd",
+    plip_command: str | Sequence[str] = "plipcmd",
     extra_args: Iterable[str] | None = None,
     raise_on_error: bool = False,
 ) -> pd.DataFrame:
