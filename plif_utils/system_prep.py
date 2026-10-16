@@ -466,7 +466,15 @@ class SystemPrep:
             pocket_mol.UpdatePropertyCache(False)
 
         self.assign_charges(pocket_mol)
-        Chem.SanitizeMol(pocket_mol, catchErrors=not self.sanitize)
+        try:
+            Chem.SanitizeMol(pocket_mol, catchErrors=not self.sanitize)
+        except Exception:
+            if self.sanitize:
+                raise
+            # In relaxed mode we keep the prepared pocket even if RDKit cannot fully
+            # kekulize/aromatize some residues. This avoids aborting the whole batch on
+            # problematic reference structures.
+            pocket_mol.UpdatePropertyCache(False)
         return plf.Molecule(pocket_mol)
 
     class mol2_supplier(plf.mol2_supplier):
