@@ -14,7 +14,7 @@ Two backends are provided:
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Iterator, Literal, Sequence
@@ -207,8 +207,23 @@ def build_reference_pocket(
 
     prep = system_prep or SystemPrep()
     reference_ligand = prep.ligand_from_file(str(reference_sdf), add_hydrogens=True)
-    protein_pocket = prep.pocket_from_pdb(str(protein_pdb), reference_ligand)
-    return reference_ligand, protein_pocket
+
+    attempts = [
+        prep,
+        replace(prep, sanitize=False),
+        replace(prep, sanitize=False, non_standard_method=None),
+    ]
+    last_error: Exception | None = None
+    for pocket_prep in attempts:
+        try:
+            protein_pocket = pocket_prep.pocket_from_pdb(str(protein_pdb), reference_ligand)
+            return reference_ligand, protein_pocket
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "Failed to prepare the reference protein pocket even after relaxed fallback modes."
+    ) from last_error
 
 
 def compute_prolif_fingerprint(
