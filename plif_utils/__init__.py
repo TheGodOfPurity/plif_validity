@@ -3,6 +3,7 @@
 from .interaction_metrics import (
     InteractionScores,
     LigandRecord,
+    SkippedMoleculeRecord,
     binary_recovery_rate,
     build_reference_pocket,
     compute_plip_feature_counts,

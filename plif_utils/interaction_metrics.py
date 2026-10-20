@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Iterator, Literal, Sequence
+import warnings
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -50,6 +51,16 @@ class LigandRecord:
     molecule_index: int
     name: str
     mol: Chem.Mol
+
+
+@dataclass(frozen=True)
+class SkippedMoleculeRecord:
+    """One skipped molecule entry originating from an SDF file."""
+
+    source_file: str
+    molecule_index: int
+    name: str
+    error: str
 
 
 @dataclass(frozen=True)
@@ -129,7 +140,16 @@ def rdkit_to_prolif_ligand(
     return plf.Molecule(mol)
 
 
-def iter_sdf_molecules(sdf_file: str | Path) -> Iterator[LigandRecord]:
+def _fallback_molecule_name(block: str, sdf_path: Path, idx: int) -> str:
+    first_line = block.splitlines()[0].strip() if block.splitlines() else ""
+    return first_line or f"{sdf_path.stem}_{idx}"
+
+
+def iter_sdf_molecules(
+    sdf_file: str | Path,
+    *,
+    verbose: bool = False,
+) -> Iterator[LigandRecord]:
     """Yield all valid molecules from an SDF file.
 
     Invalid records are skipped so that one broken generated molecule does not stop
@@ -142,36 +162,48 @@ def iter_sdf_molecules(sdf_file: str | Path) -> Iterator[LigandRecord]:
     except OSError:
         return
 
+    skipped = 0
     for idx, block in enumerate(content.split("$$$$")):
-        block = block.strip()
-        if not block:
+        if not block.strip():
             continue
-        if not block.endswith("M  END"):
-            block = f"{block}\n"
+
+        # Keep leading blank header lines intact. They are legal in mol blocks and
+        # removing them shifts the counts line away from the required line 4.
+        block = block.rstrip("\r\n")
+        block_for_parser = f"{block}\n"
+        name = _fallback_molecule_name(block, sdf_path, idx)
 
         mol = None
+        last_error = ""
         for sanitize in (True, False):
             try:
                 mol = Chem.MolFromMolBlock(
-                    f"{block}\n$$$$\n",
+                    block_for_parser,
                     sanitize=sanitize,
                     removeHs=False,
                     strictParsing=False,
                 )
-            except Exception:
+            except Exception as exc:
+                last_error = str(exc)
                 mol = None
             if mol is not None:
                 break
 
         if mol is None:
+            skipped += 1
+            if verbose:
+                warnings.warn(
+                    f"Skipping invalid molecule block {idx} from {sdf_path}: "
+                    f"{last_error or 'RDKit returned None'}"
+                )
             continue
 
         try:
-            name = mol.GetProp("_Name").strip() if mol.HasProp("_Name") else ""
+            parsed_name = mol.GetProp("_Name").strip() if mol.HasProp("_Name") else ""
         except Exception:
-            name = ""
-        if not name:
-            name = f"{sdf_path.stem}_{idx}"
+            parsed_name = ""
+        if parsed_name:
+            name = parsed_name
 
         yield LigandRecord(
             source_file=str(sdf_path),
@@ -180,20 +212,27 @@ def iter_sdf_molecules(sdf_file: str | Path) -> Iterator[LigandRecord]:
             mol=mol,
         )
 
+    if verbose and skipped:
+        warnings.warn(f"Skipped {skipped} invalid molecule blocks from {sdf_path}")
 
-def iter_generated_molecules(sdf_path_or_dir: str | Path) -> Iterator[LigandRecord]:
+
+def iter_generated_molecules(
+    sdf_path_or_dir: str | Path,
+    *,
+    verbose: bool = False,
+) -> Iterator[LigandRecord]:
     """Yield molecules from a single SDF file or from all SDF files in a directory."""
 
     input_path = Path(sdf_path_or_dir)
     if input_path.is_file():
-        yield from iter_sdf_molecules(input_path)
+        yield from iter_sdf_molecules(input_path, verbose=verbose)
         return
 
     if not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     for sdf_file in sorted(input_path.rglob("*.sdf")):
-        yield from iter_sdf_molecules(sdf_file)
+        yield from iter_sdf_molecules(sdf_file, verbose=verbose)
 
 
 def build_reference_pocket(
@@ -411,6 +450,7 @@ def evaluate_generated_molecules_prolif(
     interactions: Sequence[str] | None = None,
     interaction_parameters: dict[str, dict] | None = None,
     raise_on_error: bool = False,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """Score a directory of generated ligands with the ProLIF backend."""
 
@@ -429,7 +469,7 @@ def evaluate_generated_molecules_prolif(
     reference_counts = prolif_fingerprint_to_counts(reference_fp)
 
     results: list[InteractionScores] = []
-    for record in iter_generated_molecules(generated_sdf_path):
+    for record in iter_generated_molecules(generated_sdf_path, verbose=verbose):
         try:
             ligand = rdkit_to_prolif_ligand(record.mol)
             query_fp = compute_prolif_fingerprint(
@@ -465,6 +505,10 @@ def evaluate_generated_molecules_prolif(
                 )
             )
 
+    if verbose and not results:
+        warnings.warn(
+            f"No valid generated molecules were loaded from {generated_sdf_path}"
+        )
     return pd.DataFrame(asdict(result) for result in results)
 
 
@@ -621,7 +665,25 @@ def _plip_interaction_to_feature(interaction_type: str, interaction: object) -> 
 def _select_plip_interaction_set(analyzer: object, residue_name: str = "LIG") -> object:
     interaction_sets = getattr(analyzer, "interaction_sets", None)
     if not interaction_sets:
-        raise ValueError("PLIP did not produce any interaction set")
+        ligand_labels = []
+        for ligand in getattr(analyzer, "ligands", []) or []:
+            ligand_labels.append(
+                ":".join(
+                    filter(
+                        None,
+                        [
+                            _safe_getattr(ligand, "hetid"),
+                            _safe_getattr(ligand, "chain"),
+                            _safe_getattr(ligand, "position"),
+                            _safe_getattr(ligand, "longname"),
+                        ],
+                    )
+                )
+            )
+        raise ValueError(
+            "PLIP did not produce any interaction set. "
+            f"Detected ligands={ligand_labels or '[]'}"
+        )
 
     for ligand in getattr(analyzer, "ligands", []) or []:
         hetid = _safe_getattr(ligand, "hetid")
@@ -642,6 +704,7 @@ def compute_plip_feature_counts_from_complex(
     complex_pdb: str | Path,
     *,
     ligand_residue_name: str = "LIG",
+    verbose: bool = False,
 ) -> dict[str, int]:
     """Use the installed PLIP Python package to extract interaction feature counts."""
 
@@ -656,6 +719,28 @@ def compute_plip_feature_counts_from_complex(
     analyzer.output_path = str(Path(complex_pdb).parent)
     analyzer.load_pdb(str(complex_pdb))
     analyzer.analyze()
+
+    if verbose:
+        ligand_labels = []
+        for ligand in getattr(analyzer, "ligands", []) or []:
+            ligand_labels.append(
+                ":".join(
+                    filter(
+                        None,
+                        [
+                            _safe_getattr(ligand, "hetid"),
+                            _safe_getattr(ligand, "chain"),
+                            _safe_getattr(ligand, "position"),
+                            _safe_getattr(ligand, "longname"),
+                        ],
+                    )
+                )
+            )
+        warnings.warn(
+            "PLIP debug: "
+            f"ligands={ligand_labels or []}, "
+            f"interaction_sets={list(getattr(analyzer, 'interaction_sets', {}).keys())}"
+        )
 
     interaction_set = _select_plip_interaction_set(
         analyzer,
@@ -673,6 +758,7 @@ def compute_plip_feature_counts(
     ligand_mol: Chem.Mol,
     *,
     ligand_residue_name: str = "LIG",
+    verbose: bool = False,
 ) -> dict[str, int]:
     """Run PLIP on one protein-ligand pair and return flat interaction feature counts."""
 
@@ -687,6 +773,7 @@ def compute_plip_feature_counts(
         return compute_plip_feature_counts_from_complex(
             complex_pdb=complex_pdb,
             ligand_residue_name=ligand_residue_name,
+            verbose=verbose,
         )
 
 
@@ -705,6 +792,7 @@ def evaluate_generated_molecules_plip(
     *,
     ligand_residue_name: str = "LIG",
     raise_on_error: bool = False,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """Score a directory of generated ligands with the PLIP backend."""
 
@@ -713,15 +801,17 @@ def evaluate_generated_molecules_plip(
         protein_pdb=protein_pdb,
         ligand_mol=reference_mol,
         ligand_residue_name=ligand_residue_name,
+        verbose=verbose,
     )
 
     results: list[InteractionScores] = []
-    for record in iter_generated_molecules(generated_sdf_path):
+    for record in iter_generated_molecules(generated_sdf_path, verbose=verbose):
         try:
             query_counts = compute_plip_feature_counts(
                 protein_pdb=protein_pdb,
                 ligand_mol=record.mol,
                 ligand_residue_name=ligand_residue_name,
+                verbose=verbose,
             )
             results.append(
                 score_feature_counts(
@@ -748,4 +838,8 @@ def evaluate_generated_molecules_plip(
                 )
             )
 
+    if verbose and not results:
+        warnings.warn(
+            f"No valid generated molecules were loaded from {generated_sdf_path}"
+        )
     return pd.DataFrame(asdict(result) for result in results)
